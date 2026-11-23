@@ -852,6 +852,9 @@ peek_subshell_switch_key (const char *buffer, size_t len)
 {
     csi_command_t csi;
 
+    // check for standard escape sequence Alt+Ctrl+O: \e\x0f
+    return (len > 1 && buffer[0] == 0x1b && buffer[1] == 0x0f);
+
     if (len == 0)
         return FALSE;
     if (buffer[0] == (XCTRL ('o') & 255))
