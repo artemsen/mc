@@ -2035,6 +2035,170 @@ do_confirm_erase (const WPanel *panel, const char *source, struct stat *src_stat
 }
 
 /* --------------------------------------------------------------------------------------------- */
+/* {{{ Trash (recycle bin) support */
+
+/**
+ * Return the path of the trash base directory (${HOME}/.local/trash), creating
+ * it (and any missing parents) on demand.
+ *
+ * @return newly-allocated string with the trash dir path, or NULL on error
+ */
+static char *
+trash_get_base_dir (void)
+{
+    char *trash_dir;
+    vfs_path_t *trash_vpath;
+    int res;
+
+    trash_dir = mc_build_filename (mc_config_get_home_dir (), ".local", "trash", (char *) NULL);
+    trash_vpath = vfs_path_from_str (trash_dir);
+    res = mc_mkdir (trash_vpath, 0700);
+    vfs_path_free (trash_vpath, TRUE);
+    if (res == -1 && errno != EEXIST)
+    {
+        message (D_ERROR, MSG_ERROR, _ ("Cannot create trash directory\n%s"), trash_dir);
+        g_free (trash_dir);
+        return NULL;
+    }
+
+    return trash_dir;
+}
+
+/**
+ * Delete a single file or directory by moving it into the trash bin, preserving
+ * its original location: an entry at /abc/file is kept as
+ * ${HOME}/.local/trash/abc/file. If an entry with the same name already exists
+ * at that location in the trash, a ".N" postfix is appended to the name
+ * ("file.txt", "file.txt.1", "file.txt.2", ...) so nothing already in the trash
+ * is ever overwritten.
+ *
+ * @param panel pointer to panel in case of single entry, NULL otherwise
+ * @param ctx file operation context object
+ * @param src_vpath absolute path (as a vfs_path_t) of the entry to delete
+ * @param src_stat stat of the entry to delete
+ *
+ * @return operation result
+ */
+static FileProgressStatus
+delete_entry (const WPanel *panel, file_op_context_t *ctx, vfs_path_t *src_vpath,
+              struct stat *src_stat)
+{
+    FileProgressStatus return_status = FILE_CONT;
+    char *trash_dir;
+    char *src_dir;
+    char *rel_dir;
+    char *target_dir = NULL;
+    char *target = NULL;
+    char *basename;
+    int n;
+    vfs_path_t *target_dir_vpath;
+    vfs_path_t *dst_vpath;
+    const gboolean is_dir = S_ISDIR (src_stat->st_mode);
+    const char *src_abs;
+
+    /* Files living on /mnt (external mounts) are deleted permanently instead
+     * of being moved to the trash. */
+    src_abs = vfs_path_as_str (src_vpath);
+    if (g_str_has_prefix (src_abs, "/mnt"))
+    {
+        if (is_dir)
+            return erase_dir (ctx, src_vpath);
+        return erase_file (ctx, src_vpath);
+    }
+
+    trash_dir = trash_get_base_dir ();
+    if (trash_dir == NULL)
+        return FILE_ABORT;
+
+    /* Mirror the source entry's directory below the trash so the original
+     * location is preserved. E.g. /abc/file is kept as ${HOME}/.local/trash/abc/file. */
+    src_dir = g_path_get_dirname (src_abs);
+    rel_dir = src_dir + (src_dir[0] == '/' ? 1 : 0);
+    if (rel_dir[0] == '\0')
+        target_dir = g_strdup (trash_dir);
+    else
+        target_dir = mc_build_filename (trash_dir, rel_dir, (char *) NULL);
+    g_free (src_dir);
+
+    target_dir_vpath = vfs_path_from_str (target_dir);
+    (void) mc_mkdir (target_dir_vpath, 0700);
+    vfs_path_free (target_dir_vpath, TRUE);
+
+    /* Find a free name in the mirrored directory, appending ".N" while a conflict exists */
+    basename = g_path_get_basename (src_abs);
+    target = mc_build_filename (target_dir, basename, (char *) NULL);
+    for (n = 1; g_file_test (target, G_FILE_TEST_EXISTS); n++)
+    {
+        char *name;
+
+        name = g_strdup_printf ("%s.%d", basename, n);
+        g_free (target);
+        target = mc_build_filename (target_dir, name, (char *) NULL);
+        g_free (name);
+    }
+
+    /* Update the (delete-type) progress dialog the same way the erase code did */
+    file_progress_show_deleting (ctx, src_vpath, &ctx->total_progress_count);
+    file_progress_show_count (ctx);
+    if (file_progress_check_buttons (ctx) == FILE_ABORT)
+        return_status = FILE_ABORT;
+    else
+    {
+        mc_refresh ();
+        dst_vpath = vfs_path_from_str (target);
+
+        for (;;)
+        {
+            if (mc_rename (src_vpath, dst_vpath) == 0)
+            {
+                return_status = FILE_CONT;
+                break;
+            }
+
+            if (errno == EXDEV)
+            {
+                /* Trash lives on a different filesystem: fall back to the copy + remove
+                   machinery. Its progress calls assume source/target widgets which the
+                   delete dialog lacks, so recreate the dialog for them (unless we are a
+                   background child, which never owns a dialog). */
+                if (!mc_global.we_are_background)
+                {
+                    file_progress_ui_destroy (ctx);
+                    file_progress_ui_create (ctx, TRUE, FILEGUI_DIALOG_MULTI_ITEM);
+                }
+                if (is_dir)
+                    return_status = do_move_dir_dir (panel, ctx, vfs_path_as_str (src_vpath),
+                                                     target);
+                else
+                    return_status = move_file_file (panel, ctx, vfs_path_as_str (src_vpath),
+                                                    target);
+                break;
+            }
+
+            return_status = files_error (ctx, TRUE, _ ("Cannot move file\n%s\nto\n%s"),
+                                         vfs_path_as_str (src_vpath), target);
+            if (return_status == FILE_RETRY)
+                continue;
+            if (return_status == FILE_IGNORE_ALL)
+                ctx->ignore_all = TRUE;
+            break;
+        }
+
+        vfs_path_free (dst_vpath, TRUE);
+    }
+
+    file_progress_show_count (ctx);
+    g_free (target);
+    g_free (target_dir);
+    g_free (basename);
+    g_free (trash_dir);
+
+    return return_status;
+}
+
+/* }}} */
+
+/* --------------------------------------------------------------------------------------------- */
 
 static FileProgressStatus
 operate_single_file (const WPanel *panel, file_op_context_t *ctx, const char *src,
@@ -2063,12 +2227,7 @@ operate_single_file (const WPanel *panel, file_op_context_t *ctx, const char *sr
     {
         value = panel_operate_init_totals (panel, src_vpath, src_stat, ctx, !is_file, dialog_type);
         if (value == FILE_CONT)
-        {
-            if (is_file)
-                value = erase_file (ctx, src_vpath);
-            else
-                value = erase_dir (ctx, src_vpath);
-        }
+            value = delete_entry (panel, ctx, src_vpath, src_stat);
     }
     else
     {
@@ -2153,12 +2312,7 @@ operate_one_file (const WPanel *panel, file_op_context_t *ctx, const char *src,
     is_file = !S_ISDIR (src_stat->st_mode);
 
     if (ctx->operation == OP_DELETE)
-    {
-        if (is_file)
-            value = erase_file (ctx, src_vpath);
-        else
-            value = erase_dir (ctx, src_vpath);
-    }
+        value = delete_entry (NULL, ctx, src_vpath, src_stat);
     else
     {
         char *temp;
